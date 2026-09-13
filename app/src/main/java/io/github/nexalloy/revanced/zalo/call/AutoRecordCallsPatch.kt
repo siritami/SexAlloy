@@ -36,11 +36,12 @@ import java.util.concurrent.ConcurrentHashMap
  * `CallRecordingsActivity`, `ConfigProvider`) are intentionally dropped.
  *
  * ## Obfuscation
- * No version-pinned obfuscated symbols. The primary path uses only non-obfuscated
- * ZRTC names in [CallRecordingSymbols]. Fallbacks discover state at runtime:
- * concrete CallCallback subclasses via `zrtc_peer_register_callback`, session
- * re-bind by scanning callback fields for known peer handles, and a secondary
- * start trigger from stable Activity lifecycle methods on `ZmInCallActivity`.
+ * No version-pinned obfuscated symbols. Stable ZRTC names live in
+ * [CallRecordingSymbols]. Concrete CallCallback subclasses are discovered with
+ * DexKit ([concreteCallbackLifecycleMethods]) and pre-hooked — the base class
+ * alone is not enough because overrides do not call super. Session re-bind
+ * scans instance fields for known peer handles. Activity fallback uses only
+ * framework lifecycle names and never invents connect flags.
  *
  * ## Legal note
  * Call recording is regulated differently across jurisdictions and often requires
@@ -97,7 +98,11 @@ private object CallRecorder {
         hooks += hookAudioStreamRegistration(peerClass)
         hooks += hookPeerTermination(peerClass)
         hooks += hookCallbackRegistration(peerClass)
+        // Base-class hooks alone are a no-op for production callbacks: the concrete
+        // subclass overrides every lifecycle method without calling super. Pre-hook
+        // those overrides (discovered by stable ZRTC method names) before any call.
         hooks += hookCallbackBase(classLoader)
+        hooks += hookDiscoveredCallbackMethods(executor)
         hooks += hookActivities(classLoader)
         hooks += hookNotifications()
 
@@ -105,6 +110,43 @@ private object CallRecorder {
         Logger.printInfo { "[Zalo] Auto-record installed $hooks hooks" }
 
         recoverPending()
+    }
+
+    /**
+     * DexKit-discovered overrides on concrete CallCallback subclasses.
+     * Restores the old `CURRENT_CALLBACK_CLASS` pre-hook without pinning names.
+     */
+    private fun hookDiscoveredCallbackMethods(executor: PatchExecutor): Int {
+        var count = 0
+        val methods = runCatching {
+            with(executor) { ::concreteCallbackLifecycleMethods.dexMethodList }
+        }.getOrElse {
+            Logger.printException({ "[Zalo] CallCallback DexKit lookup failed" }, it)
+            return 0
+        }
+        Logger.printInfo { "[Zalo] concrete CallCallback candidates: ${methods.size}" }
+        for (dexMethod in methods) {
+            try {
+                val owner = loadOrNull(dexMethod.className, executor.classLoader) ?: continue
+                // Name-only DexKit matches can hit unrelated classes; keep only
+                // real CallCallback subclasses (not the empty base impl).
+                if (owner.name == CallRecordingSymbols.CALL_CALLBACK) continue
+                if (!isCallCallback(owner)) continue
+                val method = with(executor) { dexMethod.toMethod() }
+                val signature = owner.name + "#" + method.toGenericString()
+                if (!HOOKED_CALLBACKS.add(signature)) continue
+                method.isAccessible = true
+                hookMember(method, callbackHook(method))
+                count++
+            } catch (t: Throwable) {
+                Logger.printException(
+                    { "[Zalo] discovered callback hook failed: $dexMethod" },
+                    t
+                )
+            }
+        }
+        Logger.printInfo { "[Zalo] hooked $count concrete CallCallback methods" }
+        return count
     }
 
     // --- Peer metadata: partner UID + call direction ---------------------------
@@ -305,13 +347,17 @@ private object CallRecorder {
         activity ?: return
         val session = resolveCurrentSession(activity) ?: return
         if (session.deleted) return
-        // PeerJNI is_in_call is the version-stable stand-in for Zalo's obfuscated
-        // "controls ready / connected" check on the in-call activity state object.
-        if (!isPeerActive(session)) return
+        // Only kick start() if PeerJNI already reported the call as connected.
+        // Do NOT invent confirmed/audio flags here — that starts capture before
+        // streams are up and produces empty/broken WAVs that finalize drops.
+        val shouldStart: Boolean
         synchronized(session) {
-            session.confirmed = true
-            session.audioConnected = true
+            shouldStart = CallRecordingLifecycle.shouldStartAudio(
+                session.confirmed, session.audioConnected
+            )
         }
+        if (!shouldStart) return
+        if (!isPeerActive(session)) return
         start(session, trigger)
     }
 
