@@ -96,16 +96,22 @@ private object CallRecorder {
         // Presence check only; not stored (used for staleness assurance).
         peerClass.getDeclaredMethod(IS_IN_CALL, Long::class.javaPrimitiveType)
 
-        var hooks = 0
-        hooks += hookPeerMetadata(peerClass)
-        hooks += hookAudioStreamRegistration(peerClass)
-        hooks += hookPeerTermination(peerClass)
-        hooks += hookCallbackRegistration(peerClass)
-        hooks += hookCallbackClass(resolveCallbackClass(executor))
-        hooks += hookNotifications(classLoader)
+        val meta = hookPeerMetadata(peerClass)
+        val audio = hookAudioStreamRegistration(peerClass)
+        val term = hookPeerTermination(peerClass)
+        val reg = hookCallbackRegistration(peerClass)
+        // Proactively hook the callback subclass found by shape. This is a bonus:
+        // the register_callback hook above also hooks the callback's real runtime
+        // class, which needs neither fingerprint nor hardcoded name.
+        val cb = hookCallbackClass(resolveCallbackClass(executor))
+        val notif = hookNotifications(classLoader)
 
+        val hooks = meta + audio + term + reg + cb + notif
+        Logger.printInfo {
+            "[Zalo] Auto-record hooks: meta=$meta audio=$audio term=$term " +
+                "register=$reg callbackFingerprint=$cb notify=$notif (total=$hooks)"
+        }
         check(hooks > 0) { "No call lifecycle hooks installed" }
-        Logger.printInfo { "[Zalo] Auto-record installed $hooks hooks" }
 
         appContext?.let { CallRecordingOutput.recoverPending(it, null) }
     }
@@ -201,8 +207,19 @@ private object CallRecorder {
                 val args = param.args ?: return@before
                 if (args.size < 2 || args[0] !is Long || args[1] == null) return@before
                 val peerHandle = args[0] as Long
+                val callback = args[1]!!
                 val session = sessionForPeer(peerHandle)
-                SESSIONS[args[1]!!] = session
+                SESSIONS[callback] = session
+                // Primary, name-free obfuscation defense: hook the callback's REAL
+                // runtime class. Whatever Zalo renamed it to, this is the exact class
+                // whose onCall* methods will fire. Deduplicated against the fingerprint
+                // hooks by method signature, so double-registration is harmless.
+                val added = hookCallbackClass(callback.javaClass)
+                if (added > 0) {
+                    Logger.printInfo {
+                        "[Zalo] hooked callback class ${callback.javaClass.name} (+$added)"
+                    }
+                }
             }
         }
 
@@ -341,6 +358,11 @@ private object CallRecorder {
         }
         val app = appContext ?: return
         if (tempFile == null) return
+        Logger.printInfo {
+            val size = if (tempFile.isFile) tempFile.length() else -1L
+            "[Zalo] stop trigger=$trigger dir=$direction wav=${tempFile.name} bytes=$size " +
+                "-> finalizing"
+        }
         CallRecordingOutput.finalizeRecording(
             app, tempFile, startedAt, direction, peerUid,
             observed.displayName, observed.phoneNumber, null

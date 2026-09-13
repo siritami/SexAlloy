@@ -6,6 +6,7 @@ import android.content.Context;
 import android.net.Uri;
 import android.os.Build;
 import android.provider.MediaStore;
+import android.util.Log;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -25,22 +26,23 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * In-process finalization for captured Zalo call audio.
+ * In-process finalization for captured Zalo call audio: repair native WAV header
+ * → transcode to M4A → publish to the shared MediaStore, all under Zalo's UID.
  *
- * <p>Ported and simplified from the Zalo Patch {@code CallRecordingStore}. The
- * original ran in the module process and received raw WAV bytes over a broadcast
- * to a module-owned receiver. NexAlloy patch code already runs inside {@code
- * com.zing.zalo}, which holds the audio and storage permissions, so this class
- * does the whole finalization in-process: it repairs the native WAV header,
- * transcodes it to M4A with {@link CallRecordingTranscoder}, and publishes the
- * result to the shared MediaStore under Zalo's own UID.
- *
- * <p>All work is off the caller's thread on a single-thread executor.
+ * <p>Logs every stage to logcat tag {@value #TAG}. On failure it KEEPS the source
+ * WAV (renamed to {@code *.failed.wav} beside the cache) so you can confirm whether
+ * capture worked, instead of deleting the evidence.
  */
 public final class CallRecordingOutput {
-    /** Cache subdirectory that holds native temp WAV files. */
+    public static final String TAG = "NexAlloyCall";
+
     static final String TEMP_DIRECTORY = "nexalloy_call_recordings";
-    private static final String SHARED_DIRECTORY = "Recordings/Zalo Call Recordings";
+
+    // "Recordings/" is only a valid MediaStore top-level dir on Android 12 (API 31)+.
+    // On 10/11 an insert into it returns null / throws, so fall back to "Music/".
+    private static final String DIR_MODERN = "Recordings/Zalo Call Recordings";
+    private static final String DIR_LEGACY = "Music/Zalo Call Recordings";
+
     private static final Pattern PART_NAME = Pattern.compile(
             "zalo-call-(\\d{13})-(incoming|outgoing|unknown)-([0-9a-f]{8})\\.part");
     private static final ExecutorService FINALIZER = Executors.newSingleThreadExecutor(r -> {
@@ -60,11 +62,10 @@ public final class CallRecordingOutput {
     private CallRecordingOutput() {
     }
 
-    /** Directory (in Zalo's cache) where native WAV temp files are written. */
     public static File tempDirectory(Context context) {
         File directory = new File(context.getCacheDir(), TEMP_DIRECTORY);
-        if (!directory.exists()) {
-            directory.mkdirs();
+        if (!directory.exists() && !directory.mkdirs()) {
+            Log.w(TAG, "Could not create temp dir " + directory);
         }
         return directory;
     }
@@ -84,13 +85,6 @@ public final class CallRecordingOutput {
         return file != null && file.isFile() && CallRecordingTranscoder.repairHeader(file);
     }
 
-    /**
-     * Queues the captured native WAV for conversion and publication. Caller
-     * identity is resolved on the finalizer thread from Zalo's local databases
-     * (via {@link CallRecordingContacts}), falling back to the values observed
-     * from the call notification. The source file is consumed (deleted) once the
-     * M4A is stored.
-     */
     public static void finalizeRecording(
             Context context,
             File wavFile,
@@ -101,46 +95,61 @@ public final class CallRecordingOutput {
             String fallbackPhone,
             StatusListener listener) {
         if (context == null || wavFile == null) {
+            Log.w(TAG, "finalizeRecording: null context/wav");
             if (listener != null) listener.onFailed();
             return;
         }
         final Context app = context.getApplicationContext();
         final String key = wavFile.getAbsolutePath();
         if (!QUEUED.add(key)) {
+            Log.i(TAG, "finalizeRecording: already queued " + wavFile.getName());
             return;
         }
         FINALIZER.execute(() -> {
             try {
+                long size = wavFile.isFile() ? wavFile.length() : -1L;
+                Log.i(TAG, "finalize start: " + wavFile.getName() + " bytes=" + size
+                        + " uid=" + peerUid + " dir=" + direction);
                 CallRecordingContacts.Result contact =
                         CallRecordingContacts.resolve(app, peerUid, fallbackName, fallbackPhone);
                 boolean ok = convertAndPublish(app, wavFile, startedAt,
                         contact.displayName, contact.phoneNumber);
-                if (listener != null) {
-                    if (ok) listener.onSaved();
-                    else listener.onFailed();
+                if (ok) {
+                    Log.i(TAG, "finalize OK: saved to MediaStore");
+                    if (listener != null) listener.onSaved();
+                } else {
+                    File kept = preserveFailed(wavFile);
+                    Log.e(TAG, "finalize FAILED: WAV kept at " + kept);
+                    if (listener != null) listener.onFailed();
                 }
+            } catch (Throwable t) {
+                File kept = preserveFailed(wavFile);
+                Log.e(TAG, "finalize EXCEPTION: WAV kept at " + kept, t);
+                if (listener != null) listener.onFailed();
             } finally {
                 QUEUED.remove(key);
             }
         });
     }
 
-    /** Re-attempts any leftover WAV files from a call that ended during a crash/kill. */
     public static void recoverPending(Context context, StatusListener listener) {
         final Context app = context.getApplicationContext();
         FINALIZER.execute(() -> {
             File[] pending = tempDirectory(app).listFiles(
                     (ignored, name) -> name.endsWith(".part"));
-            if (pending == null) {
+            if (pending == null || pending.length == 0) {
                 return;
             }
+            Log.i(TAG, "recoverPending: " + pending.length + " leftover WAV(s)");
             for (File file : pending) {
                 if (!isNativeImportReady(file) && !repairNativeImport(file)) {
+                    Log.w(TAG, "recoverPending: not valid PCM, skipping " + file.getName());
                     continue;
                 }
                 Matcher matcher = PART_NAME.matcher(file.getName());
                 long startedAt = matcher.matches() ? parseLong(matcher.group(1)) : file.lastModified();
                 boolean ok = convertAndPublish(app, file, startedAt, "Zalo contact", "");
+                if (!ok) preserveFailed(file);
                 if (listener != null) {
                     if (ok) listener.onSaved();
                     else listener.onFailed();
@@ -151,20 +160,33 @@ public final class CallRecordingOutput {
 
     private static boolean convertAndPublish(
             Context context, File wavFile, long startedAt, String displayName, String phoneNumber) {
-        if (!isNativeImportReady(wavFile) && !repairNativeImport(wavFile)) {
+        if (wavFile == null || !wavFile.isFile() || wavFile.length() <= 0L) {
+            Log.e(TAG, "convert: source WAV missing or empty "
+                    + (wavFile == null ? "null" : wavFile.getName()
+                    + " bytes=" + (wavFile.isFile() ? wavFile.length() : -1L)));
             return false;
+        }
+        if (!isNativeImportReady(wavFile)) {
+            boolean repaired = repairNativeImport(wavFile);
+            Log.i(TAG, "convert: header repair " + (repaired ? "OK" : "FAILED")
+                    + " for " + wavFile.getName());
+            if (!repaired) return false;
         }
         File encoded = new File(wavFile.getParentFile(), wavFile.getName() + ".m4a.tmp");
         try {
             CallRecordingTranscoder.wavToM4a(wavFile, encoded);
+            Log.i(TAG, "convert: transcoded to " + encoded.length() + " bytes");
             Uri saved = publish(context, encoded,
                     buildDisplayName(startedAt, displayName, phoneNumber));
             if (saved == null) {
+                Log.e(TAG, "convert: MediaStore publish returned null");
                 return false;
             }
+            Log.i(TAG, "convert: published " + saved);
             wavFile.delete();
             return true;
-        } catch (Throwable throwable) {
+        } catch (Throwable t) {
+            Log.e(TAG, "convert: transcode/publish failed", t);
             return false;
         } finally {
             encoded.delete();
@@ -175,15 +197,35 @@ public final class CallRecordingOutput {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
             throw new IOException("Shared call recordings require Android 10 or newer");
         }
+        // Prefer Recordings/ on API 31+, else Music/. If the preferred path is rejected
+        // (older API, OEM quirk), retry with the other before giving up.
+        boolean modernFirst = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
+        String primary = modernFirst ? DIR_MODERN : DIR_LEGACY;
+        String secondary = modernFirst ? DIR_LEGACY : DIR_MODERN;
+        Uri uri = insertInto(context, source, displayName, primary);
+        if (uri == null) {
+            Log.w(TAG, "publish: insert into '" + primary + "' failed, trying '" + secondary + "'");
+            uri = insertInto(context, source, displayName, secondary);
+        }
+        return uri;
+    }
+
+    private static Uri insertInto(Context context, File source, String displayName, String relPath) {
         ContentResolver resolver = context.getContentResolver();
         ContentValues values = new ContentValues();
         values.put(MediaStore.Audio.Media.DISPLAY_NAME, displayName);
         values.put(MediaStore.Audio.Media.TITLE,
                 displayName.substring(0, displayName.length() - ".m4a".length()));
         values.put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4");
-        values.put(MediaStore.Audio.Media.RELATIVE_PATH, SHARED_DIRECTORY);
+        values.put(MediaStore.Audio.Media.RELATIVE_PATH, relPath);
         values.put(MediaStore.Audio.Media.IS_PENDING, 1);
-        Uri uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values);
+        Uri uri;
+        try {
+            uri = resolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values);
+        } catch (Throwable t) {
+            Log.e(TAG, "insert threw for '" + relPath + "'", t);
+            return null;
+        }
         if (uri == null) {
             return null;
         }
@@ -193,17 +235,23 @@ public final class CallRecordingOutput {
                 throw new IOException("Shared output unavailable");
             }
             copy(input, output);
-        } catch (Throwable throwable) {
+        } catch (Throwable t) {
             resolver.delete(uri, null, null);
-            if (throwable instanceof IOException) {
-                throw (IOException) throwable;
-            }
-            throw new IOException(throwable);
+            Log.e(TAG, "insert: copy failed for '" + relPath + "'", t);
+            return null;
         }
         ContentValues complete = new ContentValues();
         complete.put(MediaStore.Audio.Media.IS_PENDING, 0);
         resolver.update(uri, complete, null, null);
         return uri;
+    }
+
+    /** Rename a WAV we could not publish so the next run won't retry it, but keep it for inspection. */
+    private static File preserveFailed(File wavFile) {
+        if (wavFile == null || !wavFile.isFile()) return null;
+        File kept = new File(wavFile.getParentFile(),
+                wavFile.getName().replace(".part", "") + ".failed.wav");
+        return wavFile.renameTo(kept) ? kept : wavFile;
     }
 
     static String buildDisplayName(long startedAt, String displayName, String phoneNumber) {
