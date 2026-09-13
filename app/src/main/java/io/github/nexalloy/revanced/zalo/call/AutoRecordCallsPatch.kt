@@ -5,9 +5,6 @@ import android.app.Notification
 import android.content.Context
 import app.morphe.extension.shared.Logger
 import io.github.nexalloy.PatchExecutor
-import io.github.nexalloy.callMethodOrNull
-import io.github.nexalloy.getLongFieldOrNull
-import io.github.nexalloy.getObjectFieldOrNull
 import io.github.nexalloy.hookMethod
 import io.github.nexalloy.patch
 import java.io.File
@@ -39,10 +36,11 @@ import java.util.concurrent.ConcurrentHashMap
  * `CallRecordingsActivity`, `ConfigProvider`) are intentionally dropped.
  *
  * ## Obfuscation
- * The primary path uses only non-obfuscated names and needs no fingerprints. The
- * peer-manager re-bind and the in-call-activity trigger use obfuscated symbols
- * pinned in [CallRecordingSymbols]; if they stop resolving, those fallbacks are
- * skipped and recording still works from the primary path.
+ * No version-pinned obfuscated symbols. The primary path uses only non-obfuscated
+ * ZRTC names in [CallRecordingSymbols]. Fallbacks discover state at runtime:
+ * concrete CallCallback subclasses via `zrtc_peer_register_callback`, session
+ * re-bind by scanning callback fields for known peer handles, and a secondary
+ * start trigger from stable Activity lifecycle methods on `ZmInCallActivity`.
  *
  * ## Legal note
  * Call recording is regulated differently across jurisdictions and often requires
@@ -100,7 +98,6 @@ private object CallRecorder {
         hooks += hookPeerTermination(peerClass)
         hooks += hookCallbackRegistration(peerClass)
         hooks += hookCallbackBase(classLoader)
-        hooks += hookCurrentCallback(classLoader)
         hooks += hookActivities(classLoader)
         hooks += hookNotifications()
 
@@ -214,10 +211,6 @@ private object CallRecorder {
         loadOrNull(CallRecordingSymbols.CALL_CALLBACK, classLoader)
             ?.let { hookCallbackClass(it) } ?: 0
 
-    private fun hookCurrentCallback(classLoader: ClassLoader): Int =
-        loadOrNull(CallRecordingSymbols.CURRENT_CALLBACK_CLASS, classLoader)
-            ?.let { hookCallbackClass(it) } ?: 0
-
     private fun hookCallbackClass(callbackClass: Class<*>): Int {
         var count = 0
         var current: Class<*>? = callbackClass
@@ -280,40 +273,46 @@ private object CallRecorder {
         }
     }
 
-    // --- In-call activity "controls ready" secondary trigger (obfuscated) ------
+    // --- In-call activity secondary trigger (stable lifecycle, no obfuscated names)
 
+    /**
+     * Backup start edge if PeerJNI stream hooks miss a connect. Uses only
+     * framework lifecycle names so it survives Zalo obfuscation renames.
+     * Only methods declared on the Zalo activity class are hooked — never the
+     * framework `Activity` implementations.
+     */
     private fun hookActivities(classLoader: ClassLoader): Int {
         var count = 0
-        val readyMethod = CallRecordingSymbols.ACTIVITY_READY_METHOD
-        val stateField = CallRecordingSymbols.ACTIVITY_CALL_STATE_FIELD
-        val connectedMethod = CallRecordingSymbols.ACTIVITY_CONNECTED_METHOD
         for (className in CallRecordingSymbols.CALL_ACTIVITIES) {
             val activityClass = loadOrNull(className, classLoader) ?: continue
             if (!Activity::class.java.isAssignableFrom(activityClass)) continue
-            if (readyMethod.isNotEmpty()) {
-                count += hookAllByName(activityClass, readyMethod) {
-                    after { param ->
-                        if (stateField.isEmpty() || connectedMethod.isEmpty()) return@after
-                        val callState = param.thisObject.getObjectFieldOrNull(stateField)
-                            ?: return@after
-                        val connected = callState.callMethodOrNull(connectedMethod)
-                        if (connected != true) return@after
-                        val session = resolveCurrentSession(param.thisObject) ?: return@after
-                        synchronized(session) {
-                            session.confirmed = true
-                            session.audioConnected = true
-                        }
-                        start(session, "activity_ready")
-                    }
-                }
+            count += hookDeclaredByName(activityClass, "onResume") {
+                after { param -> maybeStartFromActivity(param.thisObject, "activity_resume") }
             }
-            count += hookAllByName(activityClass, "onDestroy") {
+            count += hookDeclaredByName(activityClass, "onPostResume") {
+                after { param -> maybeStartFromActivity(param.thisObject, "activity_post_resume") }
+            }
+            count += hookDeclaredByName(activityClass, "onDestroy") {
                 before { param ->
                     resolveCurrentSession(param.thisObject)?.let { stop(it, "activity_destroy") }
                 }
             }
         }
         return count
+    }
+
+    private fun maybeStartFromActivity(activity: Any?, trigger: String) {
+        activity ?: return
+        val session = resolveCurrentSession(activity) ?: return
+        if (session.deleted) return
+        // PeerJNI is_in_call is the version-stable stand-in for Zalo's obfuscated
+        // "controls ready / connected" check on the in-call activity state object.
+        if (!isPeerActive(session)) return
+        synchronized(session) {
+            session.confirmed = true
+            session.audioConnected = true
+        }
+        start(session, trigger)
     }
 
     // --- Notification observer feeds caller identity ---------------------------
@@ -419,32 +418,103 @@ private object CallRecorder {
         appContext?.let { CallRecordingOutput.recoverPending(it, null) }
     }
 
-    // --- Obfuscated peer-manager re-bind (optional) ----------------------------
+    // --- Runtime session re-bind (no obfuscated peer-manager symbols) ----------
 
-    private fun resolveCurrentSession(callback: Any?): Session? {
-        callback ?: return null
-        val managerClassName = CallRecordingSymbols.PEER_MANAGER_CLASS
-        val instanceMethod = CallRecordingSymbols.PEER_MANAGER_INSTANCE_METHOD
-        val containerField = CallRecordingSymbols.PEER_CONTAINER_FIELD
-        val handleField = CallRecordingSymbols.PEER_HANDLE_FIELD
-        if (managerClassName.isEmpty() || instanceMethod.isEmpty() ||
-            containerField.isEmpty() || handleField.isEmpty()
-        ) return null
-        return try {
-            val managerClass = loadOrNull(managerClassName, callback.javaClass.classLoader)
-                ?: return null
-            val manager = managerClass.callStaticMethodOrNull(instanceMethod) ?: return null
-            val container = manager.getObjectFieldOrNull(containerField) ?: return null
-            val peerHandle = container.getLongFieldOrNull(handleField) ?: return null
-            if (peerHandle == 0L) return null
-            val session = SESSIONS_BY_PEER.getOrPut(peerHandle) {
-                Session(peerHandle, PEER_PARTNERS[peerHandle])
-            }
-            SESSIONS[callback] = session
-            session
-        } catch (t: Throwable) {
-            null
+    /**
+     * Rebinds a callback/activity instance to the current ZRTC peer session.
+     *
+     * Order:
+     *  1. Direct map hit.
+     *  2. Long fields on the instance that match a known peer handle.
+     *  3. Single live (non-deleted, in-call) session when unambiguous.
+     */
+    private fun resolveCurrentSession(host: Any?): Session? {
+        host ?: return null
+        SESSIONS[host]?.let { existing ->
+            if (!existing.deleted) return existing
         }
+        peerHandleFromInstance(host)?.let { handle ->
+            if (handle != 0L) {
+                val session = SESSIONS_BY_PEER.getOrPut(handle) {
+                    Session(handle, PEER_PARTNERS[handle])
+                }
+                if (!session.deleted) {
+                    SESSIONS[host] = session
+                    return session
+                }
+            }
+        }
+        val live = liveSessions()
+        if (live.size == 1) {
+            val session = live.first()
+            SESSIONS[host] = session
+            return session
+        }
+        return null
+    }
+
+    private fun liveSessions(): List<Session> {
+        val result = ArrayList<Session>(2)
+        for ((_, session) in SESSIONS_BY_PEER) {
+            if (!session.deleted && isPeerActive(session)) result.add(session)
+        }
+        return result
+    }
+
+    /** Scans instance fields (and one level of nested objects) for a known peer handle. */
+    private fun peerHandleFromInstance(host: Any): Long? {
+        var type: Class<*>? = host.javaClass
+        var depth = 0
+        while (type != null && type != Any::class.java && depth < 4) {
+            for (field in type.declaredFields) {
+                if (Modifier.isStatic(field.modifiers)) continue
+                try {
+                    field.isAccessible = true
+                    val value = field.get(host) ?: continue
+                    when (value) {
+                        is Long -> {
+                            if (value != 0L && SESSIONS_BY_PEER.containsKey(value)) return value
+                        }
+                        is Int -> {
+                            val asLong = value.toLong() and 0xffffffffL
+                            if (asLong != 0L && SESSIONS_BY_PEER.containsKey(asLong)) return asLong
+                        }
+                        else -> {
+                            val nested = peerHandleFromObject(value)
+                            if (nested != null) return nested
+                        }
+                    }
+                } catch (_: Throwable) {
+                    // Inaccessible or type-mismatched field — skip.
+                }
+            }
+            type = type.superclass
+            depth++
+        }
+        return null
+    }
+
+    private fun peerHandleFromObject(target: Any, depth: Int = 0): Long? {
+        if (depth > 2) return null
+        var type: Class<*>? = target.javaClass
+        var typeDepth = 0
+        while (type != null && type != Any::class.java && typeDepth < 3) {
+            for (field in type.declaredFields) {
+                if (Modifier.isStatic(field.modifiers)) continue
+                try {
+                    field.isAccessible = true
+                    val value = field.get(target) ?: continue
+                    if (value is Long && value != 0L && SESSIONS_BY_PEER.containsKey(value)) {
+                        return value
+                    }
+                } catch (_: Throwable) {
+                    // skip
+                }
+            }
+            type = type.superclass
+            typeDepth++
+        }
+        return null
     }
 
     // --- helpers ---------------------------------------------------------------
@@ -480,12 +550,6 @@ private object CallRecorder {
         } catch (t: Throwable) {
             null
         }
-
-    private fun Class<*>.callStaticMethodOrNull(methodName: String): Any? = try {
-        de.robv.android.xposed.XposedHelpers.callStaticMethod(this, methodName)
-    } catch (t: Throwable) {
-        null
-    }
 
     private class Session(val peerHandle: Long, val peerUid: String?) {
         var direction: String = "unknown"
@@ -537,6 +601,22 @@ private fun hookAllByName(clazz: Class<*>, name: String, block: HookScope.() -> 
             }
         }
         current = current.superclass
+    }
+    return count
+}
+
+/** Hooks only methods declared on [clazz] (not inherited framework methods). */
+private fun hookDeclaredByName(clazz: Class<*>, name: String, block: HookScope.() -> Unit): Int {
+    var count = 0
+    for (method in clazz.declaredMethods) {
+        if (method.name != name) continue
+        try {
+            method.isAccessible = true
+            hookMember(method, block)
+            count++
+        } catch (t: Throwable) {
+            Logger.printException({ "[Zalo] hook failed: ${clazz.name}#$name" }, t)
+        }
     }
     return count
 }
